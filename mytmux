@@ -287,6 +287,8 @@ def main() -> None:
         print_color_table()
         return
 
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
     if args.kill_server:
         if not args.force:
             answer = input("Kill tmux server and all sessions? [y/N] ").strip().lower()
