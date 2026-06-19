@@ -270,6 +270,12 @@ def main() -> None:
         help="Kill the tmux server before setting up sessions. Prompts for confirmation.",
     )
     parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help=f"Load every JSON file found in {CONFIG_DIR}, merged alphabetically.",
+    )
+    parser.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -298,10 +304,25 @@ def main() -> None:
         run("kill-server")
         print("tmux server killed.")
 
-    if not args.configs:
-        parser.error("at least one config name/path is required (or use --color-table)")
+    if not args.configs and not args.all:
+        parser.error(
+            "at least one config name/path is required (or use --all, or --color-table)"
+        )
 
-    sessions = load_sessions(args.configs)
+    config_list = args.configs
+    if args.all:
+        found = sorted(CONFIG_DIR.glob("*.json"))
+        if not found:
+            print(f"No JSON files found in {CONFIG_DIR}.", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"--all: loading {len(found)} file(s): {', '.join(p.stem for p in found)}"
+        )
+        config_list = [
+            str(p) for p in found
+        ] + args.configs  # explicit args appended, still win on conflict
+
+    sessions = load_sessions(config_list)
     validate_sessions(sessions)
 
     for name, entry in sessions.items():
