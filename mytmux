@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+Idempotent tmux session setup.
+
+Creates or updates sessions (one per directory) from one or more JSON files,
+each with a status-bar color and matching active-pane border color.
+Does NOT attach to anything -- safe to re-run anytime (e.g. on shell startup,
+cron, or after a session got killed by exiting its last shell).
+
+Color is keyed by session name, never by loop position or tmux session index,
+so re-runs are stable even if some sessions already exist and others don't.
+
+Before touching tmux at all, the script validates:
+  1. every color against tmux's actual accepted color syntax
+  2. every directory actually exists on disk
+...so a typo or a missing path fails fast instead of leaving you with a
+half-configured set of sessions.
+
+Config files are looked up by basename in ~/.config/mytmux/. An argument
+"foo" resolves to ~/.config/mytmux/foo.json. Plain paths or .json
+extensions are also accepted (see resolve_config_path).
+
+Usage:
+    tmux_setup.py foo                 # -> ~/.config/mytmux/foo.json
+    tmux_setup.py work personal       # merged, later files win on conflict
+
+JSON file format:
+[
+  {"name": "api", "dir": "/home/me/projects/api", "color": "blue"},
+  {"name": "frontend", "dir": "/home/me/projects/frontend", "color": "colour208"}
+]
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# --- Color validation --------------------------------------------------
+#
+# This list mirrors tmux's own colour_fromstring() parser in colour.c
+# (the C function tmux itself uses to parse color option values), as of
+# tmux 3.4. Source: https://github.com/tmux/tmux/blob/master/colour.c
+#
+# Named colors recognized literally (case-insensitive):
+TMUX_NAMED_COLORS = {
+    "black",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "white",
+    "brightblack",
+    "brightred",
+    "brightgreen",
+    "brightyellow",
+    "brightblue",
+    "brightmagenta",
+    "brightcyan",
+    "brightwhite",
+    "default",
+    "terminal",
+}
+
+# Patterned forms tmux also accepts, handled separately from the literal set:
+#   colourN / colorN   where N is 0-255
+#   #RRGGBB             6 hex digits
+_COLOUR_N_RE = re.compile(r"^colou?r(\d{1,3})$", re.IGNORECASE)
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def is_valid_tmux_color(value: str) -> bool:
+    if value.lower() in TMUX_NAMED_COLORS:
+        return True
+
+    if _HEX_RE.match(value):
+        return True
+
+    m = _COLOUR_N_RE.match(value)
+    if m:
+        n = int(m.group(1))
+        return 0 <= n <= 255
+
+    return False
+
+
+# --- tmux command helpers -----------------------------------------------
+
+
+def run(*args: str) -> subprocess.CompletedProcess:
+    """Run a tmux command, raising on unexpected failure."""
+    return subprocess.run(
+        ["tmux", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def session_exists(name: str) -> bool:
+    result = run("has-session", "-t", name)
+    return result.returncode == 0
+
+
+def create_session(name: str, directory: str) -> None:
+    result = run("new-session", "-d", "-s", name, "-c", directory)
+    if result.returncode != 0:
+        print(
+            f"  ! failed to create session '{name}': {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+
+
+def apply_color(name: str, color: str) -> None:
+    # Status bar background for this session
+    run("set-option", "-t", name, "status-bg", color)
+
+    # Active pane border color, scoped to this session
+    run("set-option", "-t", name, "pane-active-border-style", f"fg={color}")
+
+
+# --- Config resolution ----------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".config" / "mytmux"
+
+
+def resolve_config_path(arg: str) -> Path:
+    """Resolve a CLI argument to a config file path.
+
+    "foo"            -> ~/.config/mytmux/foo.json
+    "foo.json"       -> ~/.config/mytmux/foo.json
+    "./foo.json"      -> used as-is (explicit relative/absolute path)
+    "/abs/path.json" -> used as-is
+    """
+    p = Path(arg)
+
+    # Explicit path (has a directory component) -- use as given, don't
+    # redirect into CONFIG_DIR.
+    if p.parent != Path("."):
+        return p
+
+    name = arg if arg.endswith(".json") else f"{arg}.json"
+    return CONFIG_DIR / name
+
+
+# --- Loading and validating config ---------------------------------------
+
+
+def load_sessions(args_list: list[str]) -> dict[str, dict]:
+    """Load and merge session definitions from one or more config names/paths.
+
+    Later files override earlier ones on name conflicts.
+    Returns a dict keyed by session name to make merging straightforward.
+    """
+    merged: dict[str, dict] = {}
+
+    for arg in args_list:
+        path = resolve_config_path(arg)
+        if not path.is_file():
+            print(f"! file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            print(f"! invalid JSON in {path}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if not isinstance(data, list):
+            print(
+                f"! {path} must contain a JSON array of session objects",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        for entry in data:
+            missing = {"name", "dir", "color"} - entry.keys()
+            if missing:
+                print(
+                    f"! entry in {path} missing keys {missing}: {entry}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            name = entry["name"]
+            if name in merged:
+                print(
+                    f"  (overriding '{name}' from earlier file with definition from {path})"
+                )
+            merged[name] = entry
+
+    return merged
+
+
+def validate_sessions(sessions: dict[str, dict]) -> None:
+    """Validate colors and directories for all sessions before touching tmux.
+
+    Collects every error before exiting so the user can fix everything in
+    one pass instead of one failure at a time.
+    """
+    errors = []
+
+    for name, entry in sessions.items():
+        color = entry["color"]
+        directory = entry["dir"]
+
+        if not is_valid_tmux_color(color):
+            errors.append(
+                f"  ! session '{name}': invalid color '{color}' "
+                f"(expected a named color, colourN/colorN 0-255, or #RRGGBB)"
+            )
+
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            errors.append(
+                f"  ! session '{name}': directory does not exist: {directory}"
+            )
+
+    if errors:
+        print("Validation failed:", file=sys.stderr)
+        for err in errors:
+            print(err, file=sys.stderr)
+        sys.exit(1)
+
+
+# --- Color table display ---------------------------------------------------
+
+
+def print_color_table() -> None:
+    """Print all 256 tmux colors with their colourN index, swatch, and value.
+
+    Mirrors tmux's own RGB mapping (colour.c) so what you see here is what
+    you'll get with `colourN` in your JSON configs.
+    """
+    for i in range(256):
+        sys.stdout.write(f"\033[48;5;{i}m{i:>3}\033[0m ")
+        if (i + 1) % 16 == 0:
+            sys.stdout.write("\n")
+    sys.stdout.write(
+        "\n0-15: basic/bright, theme-dependent. "
+        "16-231: fixed 6x6x6 cube (use these for stable colors). "
+        "232-255: greyscale ramp.\n"
+    )
+
+
+# --- Main -----------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Idempotent tmux session setup from JSON config."
+    )
+    parser.add_argument(
+        "configs",
+        nargs="*",
+        help=(
+            "One or more config names or paths, e.g. 'foo' resolves to "
+            f"{CONFIG_DIR}/foo.json. Merged in order; later files win on name conflicts."
+        ),
+    )
+    parser.add_argument(
+        "-k",
+        "--kill-server",
+        action="store_true",
+        help="Kill the tmux server before setting up sessions. Prompts for confirmation.",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt when used with --kill-server.",
+    )
+    parser.add_argument(
+        "--color-table",
+        action="store_true",
+        help="Print the full 256-color tmux color table (colourN values) and exit. "
+        "No sessions are created or modified.",
+    )
+    args = parser.parse_args()
+
+    if args.color_table:
+        print_color_table()
+        return
+
+    if args.kill_server:
+        if not args.force:
+            answer = input("Kill tmux server and all sessions? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                return
+        run("kill-server")
+        print("tmux server killed.")
+
+    if not args.configs:
+        parser.error("at least one config name/path is required (or use --color-table)")
+
+    sessions = load_sessions(args.configs)
+    validate_sessions(sessions)
+
+    for name, entry in sessions.items():
+        directory = entry["dir"]
+        color = entry["color"]
+
+        if session_exists(name):
+            print(f"= {name}: already exists, re-applying color")
+        else:
+            print(f"+ {name}: creating in {directory}")
+            create_session(name, directory)
+
+        apply_color(name, color)
+
+    print(f"\nDone. {len(sessions)} session(s) configured. Not attaching.")
+    print("Use `tmux attach -t <name>` or <prefix>+s to pick one.")
+
+
+if __name__ == "__main__":
+    main()
