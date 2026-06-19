@@ -33,6 +33,7 @@ JSON file format:
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -213,7 +214,8 @@ def validate_sessions(sessions: dict[str, dict]) -> None:
                 f"(expected a named color, colourN/colorN 0-255, or #RRGGBB)"
             )
 
-        dir_path = Path(directory)
+        dir_path = Path(os.path.expandvars(directory)).expanduser()
+        entry["dir"] = str(dir_path)  # store expanded path for session creation
         if not dir_path.is_dir():
             errors.append(
                 f"  ! session '{name}': directory does not exist: {directory}"
